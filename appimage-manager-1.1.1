@@ -1,0 +1,719 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.1.1"
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+BIN_DIR="$HOME/.local/bin"
+OPT_DIR="$HOME/.local/opt"
+APP_DIR="$DATA_HOME/applications"
+ICON_BASE="$DATA_HOME/icons/hicolor"
+STATE_DIR="$DATA_HOME/appimage-manager/apps"
+
+info()    { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+success() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn()    { printf '\033[1;33m==> 警告:\033[0m %s\n' "$*" >&2; }
+die()     { printf '\033[1;31m==> 错误:\033[0m %s\n' "$*" >&2; exit 1; }
+
+usage() {
+cat <<'USAGE'
+用法：
+  appimage install <xxx.AppImage>
+  appimage uninstall <app-id>
+  appimage update <app-id> <xxx.AppImage>
+  appimage list
+  appimage info <app-id>
+  appimage ime <app-id> <auto|wayland|x11|off>
+  appimage repair <app-id>
+  appimage help
+  appimage version
+
+别名：
+  remove/rm     = uninstall
+  upgrade       = update
+  ls            = list
+  show          = info
+
+输入法模式：
+  auto          自动检测 Wayland/X11（默认，推荐）
+  wayland       Electron/Chromium 强制原生 Wayland + text-input-v3
+  x11           Electron/Chromium 强制 XWayland + Fcitx5 IM module
+  off           不注入任何输入法/显示后端参数
+
+示例：
+  appimage install ~/Downloads/ColaMD-1.9.0.AppImage
+  appimage update colamd ~/Downloads/ColaMD-1.10.0.AppImage
+  appimage info colamd
+  appimage ime colamd auto
+  appimage repair colamd
+  appimage list
+  appimage uninstall colamd
+USAGE
+}
+
+ensure_dirs() {
+    mkdir -p "$BIN_DIR" "$OPT_DIR" "$APP_DIR" "$ICON_BASE" "$STATE_DIR"
+}
+
+sanitize_id() {
+    printf '%s' "$1" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+sanitize_dir_name() {
+    printf '%s' "$1" \
+      | tr '/\n\r' '---' \
+      | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+abs_path() {
+    realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || die "无法解析路径: $1"
+}
+
+meta_dir()    { printf '%s/%s' "$STATE_DIR" "$1"; }
+meta_exists() { [[ -d "$(meta_dir "$1")" ]]; }
+meta_get() {
+    local f="$(meta_dir "$1")/$2"
+    [[ -f "$f" ]] && cat "$f" || true
+}
+meta_set() {
+    local d="$(meta_dir "$1")"
+    mkdir -p "$d"
+    printf '%s\n' "$3" > "$d/$2"
+}
+
+refresh_caches() {
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+    fi
+    if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+        gtk-update-icon-cache -f -t "$ICON_BASE" >/dev/null 2>&1 || true
+    fi
+}
+
+extract_appimage() {
+    local image="$1" work="$2"
+    chmod +x "$image"
+    (
+        cd "$work"
+        "$image" --appimage-extract >/dev/null 2>&1
+    )
+}
+
+find_desktop() {
+    local root="$1" f=""
+    f="$(find "$root" -maxdepth 2 -type f -name '*.desktop' -print -quit 2>/dev/null || true)"
+    if [[ -z "$f" && -d "$root/usr/share/applications" ]]; then
+        f="$(find "$root/usr/share/applications" -type f -name '*.desktop' -print -quit 2>/dev/null || true)"
+    fi
+    printf '%s' "$f"
+}
+
+read_desktop_value() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    grep -m1 -E "^${key}=" "$file" 2>/dev/null | cut -d= -f2- || true
+}
+
+derive_name_from_filename() {
+    local base
+    base="$(basename "$1")"
+    base="${base%.AppImage}"
+    base="${base%.appimage}"
+    printf '%s' "$base" | sed -E 's/[-_ ]?v?[0-9]+([.][0-9]+)+([-_A-Za-z0-9.]*)?$//'
+}
+
+choose_field_code() {
+    local desktop="$1" code=""
+    if [[ -n "$desktop" && -f "$desktop" ]]; then
+        code="$(grep -m1 '^Exec=' "$desktop" 2>/dev/null | grep -oE '%[fFuUdDnNickvm]' | head -n1 || true)"
+    fi
+    printf '%s' "${code:-%U}"
+}
+
+detect_runtime() {
+    local root="$1"
+    [[ -d "$root" ]] || { printf 'generic'; return 0; }
+
+    # Electron AppImage 常见结构：chrome-sandbox + resources/app.asar / electron.asar
+    if find "$root" -maxdepth 3 -type f \
+        \( -name 'electron.asar' -o -name 'app.asar' -o -name 'default_app.asar' \) \
+        -print -quit 2>/dev/null | grep -q . \
+       && find "$root" -maxdepth 2 -type f -name 'chrome-sandbox' -print -quit 2>/dev/null | grep -q .; then
+        printf 'electron'
+        return 0
+    fi
+
+    # 其他 Chromium/CEF AppImage 也可使用 Ozone/Wayland IME 参数。
+    if find "$root" -maxdepth 2 -type f -name 'chrome-sandbox' -print -quit 2>/dev/null | grep -q . \
+       && find "$root" -maxdepth 2 -type f -name 'icudtl.dat' -print -quit 2>/dev/null | grep -q .; then
+        printf 'chromium'
+        return 0
+    fi
+
+    printf 'generic'
+}
+
+write_launcher() {
+    local app_id="$1" target="$2" runtime="$3" ime_mode="$4"
+    local launcher tmp
+    launcher="$BIN_DIR/$app_id"
+    tmp="${launcher}.new.$$"
+
+    mkdir -p "$BIN_DIR"
+    cat > "$tmp" <<EOF
+#!/usr/bin/env bash
+set -e
+
+APPIMAGE=$(printf '%q' "$target")
+RUNTIME=$(printf '%q' "$runtime")
+DEFAULT_IME_MODE=$(printf '%q' "$ime_mode")
+
+# 可临时覆盖，例如：APPIMAGE_IME_MODE=x11 $app_id
+IME_MODE="\${APPIMAGE_IME_MODE:-\$DEFAULT_IME_MODE}"
+
+fcitx5_active() {
+    pgrep -x fcitx5 >/dev/null 2>&1
+}
+
+is_wayland_session() {
+    [[ "\${XDG_SESSION_TYPE:-}" == "wayland" || -n "\${WAYLAND_DISPLAY:-}" ]]
+}
+
+run_wayland() {
+    # 原生 Wayland 的 Electron/Chromium 应优先走 compositor 的 text-input 协议。
+    # GTK/Qt IM module 对这一路径不是必需的，部分环境反而会产生冲突。
+    unset GTK_IM_MODULE QT_IM_MODULE
+    if fcitx5_active; then
+        export XMODIFIERS='@im=fcitx'
+    fi
+    exec "\$APPIMAGE" \
+        --ozone-platform=wayland \
+        --enable-wayland-ime \
+        --wayland-text-input-version=3 \
+        "\$@"
+}
+
+run_x11() {
+    # X11/XWayland 下使用传统 Fcitx5 IM module。
+    if fcitx5_active; then
+        export GTK_IM_MODULE=fcitx
+        export QT_IM_MODULE=fcitx
+        export XMODIFIERS='@im=fcitx'
+    fi
+    exec "\$APPIMAGE" --ozone-platform=x11 "\$@"
+}
+
+case "\$RUNTIME:\$IME_MODE" in
+    electron:wayland|chromium:wayland)
+        run_wayland "\$@"
+        ;;
+    electron:x11|chromium:x11)
+        run_x11 "\$@"
+        ;;
+    electron:auto|chromium:auto)
+        if is_wayland_session; then
+            run_wayland "\$@"
+        else
+            run_x11 "\$@"
+        fi
+        ;;
+    *:off|generic:*)
+        exec "\$APPIMAGE" "\$@"
+        ;;
+    *)
+        echo "appimage: 未知 IME 模式: \$IME_MODE" >&2
+        echo "可选: auto, wayland, x11, off" >&2
+        exit 2
+        ;;
+esac
+EOF
+    chmod +x "$tmp"
+    mv -f "$tmp" "$launcher"
+}
+
+install_icons() {
+    local root="$1" app_id="$2" original_icon="$3" record_file="$4"
+    : > "$record_file"
+    [[ -d "$root" ]] || return 0
+
+    local installed=0 icon rel size ext dst_dir dst bn stem
+
+    if [[ -d "$root/usr/share/icons/hicolor" && -n "$original_icon" ]]; then
+        while IFS= read -r -d '' icon; do
+            bn="$(basename "$icon")"
+            stem="${bn%.*}"
+            [[ "$stem" == "$original_icon" ]] || continue
+
+            rel="${icon#"$root/usr/share/icons/hicolor/"}"
+            size="${rel%%/*}"
+            ext="${icon##*.}"
+            case "${ext,,}" in png|svg|xpm) ;; *) continue ;; esac
+
+            dst_dir="$ICON_BASE/$size/apps"
+            mkdir -p "$dst_dir"
+            dst="$dst_dir/$app_id.${ext,,}"
+            cp -f "$icon" "$dst"
+            printf '%s\n' "$dst" >> "$record_file"
+            installed=1
+        done < <(find "$root/usr/share/icons/hicolor" -type f \( -iname '*.png' -o -iname '*.svg' -o -iname '*.xpm' \) -print0 2>/dev/null)
+    fi
+
+    if (( installed == 0 )) && [[ -e "$root/.DirIcon" ]]; then
+        icon="$(readlink -f "$root/.DirIcon" 2>/dev/null || true)"
+        [[ -f "$icon" ]] || icon="$root/.DirIcon"
+        if [[ -f "$icon" ]]; then
+            ext="${icon##*.}"
+            case "${ext,,}" in
+                svg) size="scalable" ;;
+                png|xpm) size="512x512" ;;
+                *) size="" ;;
+            esac
+            if [[ -n "$size" ]]; then
+                dst_dir="$ICON_BASE/$size/apps"
+                mkdir -p "$dst_dir"
+                dst="$dst_dir/$app_id.${ext,,}"
+                cp -L -f "$icon" "$dst"
+                printf '%s\n' "$dst" >> "$record_file"
+                installed=1
+            fi
+        fi
+    fi
+
+    if (( installed == 0 )); then
+        icon="$(find "$root" -maxdepth 3 -type f \( -iname '*.png' -o -iname '*.svg' -o -iname '*.xpm' \) -print -quit 2>/dev/null || true)"
+        if [[ -n "$icon" ]]; then
+            ext="${icon##*.}"
+            [[ "${ext,,}" == "svg" ]] && size="scalable" || size="512x512"
+            dst_dir="$ICON_BASE/$size/apps"
+            mkdir -p "$dst_dir"
+            dst="$dst_dir/$app_id.${ext,,}"
+            cp -f "$icon" "$dst"
+            printf '%s\n' "$dst" >> "$record_file"
+        fi
+    fi
+}
+
+patch_desktop() {
+    local source="$1" target="$2" name="$3" exec_path="$4" icon_id="$5" field_code="$6"
+
+    if [[ -n "$source" && -f "$source" ]]; then
+        cp -f "$source" "$target"
+    else
+        printf '%s\n' \
+            '[Desktop Entry]' \
+            "Name=$name" \
+            "Exec=$exec_path $field_code" \
+            "Icon=$icon_id" \
+            'Terminal=false' \
+            'Type=Application' \
+            'Categories=Utility;' \
+            'StartupNotify=true' > "$target"
+    fi
+
+    if grep -q '^Exec=' "$target"; then
+        sed -i "s|^Exec=.*|Exec=$exec_path $field_code|" "$target"
+    else
+        sed -i "/^\[Desktop Entry\]/a Exec=$exec_path $field_code" "$target"
+    fi
+
+    if grep -q '^Icon=' "$target"; then
+        sed -i "s|^Icon=.*|Icon=$icon_id|" "$target"
+    else
+        sed -i "/^\[Desktop Entry\]/a Icon=$icon_id" "$target"
+    fi
+
+    sed -i '/^TryExec=/d' "$target"
+}
+
+atomic_copy_image() {
+    local src="$1" dst="$2" tmp
+    mkdir -p "$(dirname "$dst")"
+    tmp="${dst}.new.$$"
+    cp -f "$src" "$tmp"
+    chmod +x "$tmp"
+    mv -f "$tmp" "$dst"
+}
+
+remove_recorded_icons() {
+    local record_file="$1" p
+    [[ -f "$record_file" ]] || return 0
+    while IFS= read -r p; do
+        [[ -n "$p" ]] && rm -f -- "$p"
+    done < "$record_file"
+}
+
+remove_recorded_icons_except() {
+    local old_record="$1" keep_record="$2" p
+    [[ -f "$old_record" ]] || return 0
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ -f "$keep_record" ]] && grep -Fqx -- "$p" "$keep_record"; then
+            continue
+        fi
+        rm -f -- "$p"
+    done < "$old_record"
+}
+
+install_cmd() {
+    [[ $# -eq 1 ]] || die "用法: appimage install <xxx.AppImage>"
+    ensure_dirs
+
+    local input
+    input="$(abs_path "$1")"
+    [[ -f "$input" ]] || die "文件不存在: $input"
+    chmod +x "$input"
+
+    local tmp root desktop app_name app_id dir_name install_dir target desktop_target original_icon field_code md icons_record runtime ime_mode launcher
+    tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$tmp"' EXIT
+    root="$tmp/squashfs-root"
+
+    info "解析 AppImage..."
+    if extract_appimage "$input" "$tmp"; then
+        desktop="$(find_desktop "$root")"
+    else
+        warn "无法解包该 AppImage，将使用文件名生成应用信息。"
+        desktop=""
+    fi
+
+    app_name="$(read_desktop_value "$desktop" Name)"
+    [[ -n "$app_name" ]] || app_name="$(derive_name_from_filename "$input")"
+    app_name="${app_name//$'\n'/ }"
+    [[ -n "$app_name" ]] || die "无法识别应用名称"
+
+    app_id="$(sanitize_id "$app_name")"
+    [[ -n "$app_id" ]] || die "无法生成 app-id"
+    meta_exists "$app_id" && die "'$app_id' 已安装。请使用: appimage update $app_id <AppImage>"
+
+    dir_name="$(sanitize_dir_name "$app_name")"
+    install_dir="$OPT_DIR/$dir_name"
+    target="$install_dir/$dir_name.AppImage"
+    desktop_target="$APP_DIR/$app_id.desktop"
+    original_icon="$(read_desktop_value "$desktop" Icon)"
+    field_code="$(choose_field_code "$desktop")"
+    runtime="$(detect_runtime "$root")"
+    ime_mode="auto"
+    launcher="$BIN_DIR/$app_id"
+
+    info "安装 $app_name ($app_id)..."
+    atomic_copy_image "$input" "$target"
+    rm -f -- "$BIN_DIR/$app_id"
+    write_launcher "$app_id" "$target" "$runtime" "$ime_mode"
+
+    md="$(meta_dir "$app_id")"
+    mkdir -p "$md"
+    icons_record="$md/icons"
+    install_icons "$root" "$app_id" "$original_icon" "$icons_record"
+    patch_desktop "$desktop" "$desktop_target" "$app_name" "$launcher" "$app_id" "$field_code"
+
+    meta_set "$app_id" name "$app_name"
+    meta_set "$app_id" id "$app_id"
+    meta_set "$app_id" appimage "$target"
+    meta_set "$app_id" command "$launcher"
+    meta_set "$app_id" runtime "$runtime"
+    meta_set "$app_id" ime_mode "$ime_mode"
+    meta_set "$app_id" desktop "$desktop_target"
+    meta_set "$app_id" install_dir "$install_dir"
+    meta_set "$app_id" installed_at "$(date '+%Y-%m-%d %H:%M:%S')"
+    meta_set "$app_id" source "$(basename "$input")"
+
+    refresh_caches
+    rm -rf -- "$tmp"
+    trap - EXIT
+
+    success "$app_name 安装完成"
+    printf '命令: %s\n' "$app_id"
+}
+
+update_cmd() {
+    [[ $# -eq 2 ]] || die "用法: appimage update <app-id> <xxx.AppImage>"
+    ensure_dirs
+
+    local app_id="$1" input
+    meta_exists "$app_id" || die "未安装: $app_id"
+    input="$(abs_path "$2")"
+    [[ -f "$input" ]] || die "文件不存在: $input"
+    chmod +x "$input"
+
+    local app_name target desktop_target tmp root desktop original_icon field_code md icons_record new_icons_record runtime ime_mode launcher
+    app_name="$(meta_get "$app_id" name)"
+    target="$(meta_get "$app_id" appimage)"
+    desktop_target="$(meta_get "$app_id" desktop)"
+    md="$(meta_dir "$app_id")"
+    icons_record="$md/icons"
+    new_icons_record="$md/icons.new"
+    runtime="$(meta_get "$app_id" runtime)"
+    ime_mode="$(meta_get "$app_id" ime_mode)"
+    [[ -n "$runtime" ]] || runtime="generic"
+    [[ -n "$ime_mode" ]] || ime_mode="auto"
+    launcher="$BIN_DIR/$app_id"
+    [[ -n "$target" ]] || die "元数据损坏: 缺少 AppImage 路径"
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$tmp"' EXIT
+    root="$tmp/squashfs-root"
+
+    info "解析新版 AppImage..."
+    if extract_appimage "$input" "$tmp"; then
+        desktop="$(find_desktop "$root")"
+        runtime="$(detect_runtime "$root")"
+    else
+        warn "新版 AppImage 无法解包；将保留现有 desktop、图标和运行时类型。"
+        desktop=""
+    fi
+
+    info "更新 $app_name ($app_id)..."
+    atomic_copy_image "$input" "$target"
+    rm -f -- "$BIN_DIR/$app_id"
+    write_launcher "$app_id" "$target" "$runtime" "$ime_mode"
+
+    if [[ -n "$desktop" ]]; then
+        original_icon="$(read_desktop_value "$desktop" Icon)"
+        field_code="$(choose_field_code "$desktop")"
+
+        # 先尝试安装新版图标。若新版没有可用图标，则保留旧图标。
+        install_icons "$root" "$app_id" "$original_icon" "$new_icons_record"
+        if [[ -s "$new_icons_record" ]]; then
+            remove_recorded_icons_except "$icons_record" "$new_icons_record"
+            mv -f "$new_icons_record" "$icons_record"
+        else
+            rm -f -- "$new_icons_record"
+            warn "新版 AppImage 未找到可用图标，已保留旧图标。"
+        fi
+
+        patch_desktop "$desktop" "$desktop_target" "$app_name" "$launcher" "$app_id" "$field_code"
+    elif [[ -f "$desktop_target" ]]; then
+        field_code="$(choose_field_code "$desktop_target")"
+        patch_desktop "$desktop_target" "$desktop_target.tmp" "$app_name" "$launcher" "$app_id" "$field_code"
+        mv -f "$desktop_target.tmp" "$desktop_target"
+    fi
+
+    meta_set "$app_id" runtime "$runtime"
+    meta_set "$app_id" ime_mode "$ime_mode"
+    meta_set "$app_id" updated_at "$(date '+%Y-%m-%d %H:%M:%S')"
+    meta_set "$app_id" source "$(basename "$input")"
+
+    refresh_caches
+    rm -rf -- "$tmp"
+    trap - EXIT
+    success "$app_name 更新完成"
+}
+
+uninstall_cmd() {
+    [[ $# -eq 1 ]] || die "用法: appimage uninstall <app-id>"
+    ensure_dirs
+
+    local app_id="$1"
+    meta_exists "$app_id" || die "未安装: $app_id"
+
+    local app_name target command desktop install_dir icons_record
+    app_name="$(meta_get "$app_id" name)"
+    target="$(meta_get "$app_id" appimage)"
+    command="$(meta_get "$app_id" command)"
+    desktop="$(meta_get "$app_id" desktop)"
+    install_dir="$(meta_get "$app_id" install_dir)"
+    icons_record="$(meta_dir "$app_id")/icons"
+
+    info "卸载 $app_name ($app_id)..."
+    [[ -n "$command" ]] && rm -f -- "$command"
+    [[ -n "$desktop" ]] && rm -f -- "$desktop"
+    [[ -n "$target" ]] && rm -f -- "$target"
+    remove_recorded_icons "$icons_record"
+
+    if [[ -n "$install_dir" && -d "$install_dir" ]]; then
+        rmdir "$install_dir" 2>/dev/null || warn "安装目录非空，已保留: $install_dir"
+    fi
+
+    rm -rf -- "$(meta_dir "$app_id")"
+    refresh_caches
+    success "$app_name 已卸载"
+}
+
+list_cmd() {
+    ensure_dirs
+    local any=0 d id name source installed updated size file
+
+    printf '%-22s %-28s %-20s %-10s %s\n' "ID" "NAME" "SOURCE" "SIZE" "INSTALLED/UPDATED"
+    printf '%-22s %-28s %-20s %-10s %s\n' \
+        "----------------------" "----------------------------" "--------------------" "----------" "-------------------"
+
+    shopt -s nullglob
+    for d in "$STATE_DIR"/*; do
+        [[ -d "$d" ]] || continue
+        any=1
+        id="$(basename "$d")"
+        name="$(meta_get "$id" name)"
+        source="$(meta_get "$id" source)"
+        installed="$(meta_get "$id" installed_at)"
+        updated="$(meta_get "$id" updated_at)"
+        file="$(meta_get "$id" appimage)"
+
+        if [[ -f "$file" ]]; then
+            size="$(du -h "$file" | awk '{print $1}')"
+        else
+            size="missing"
+        fi
+
+        printf '%-22.22s %-28.28s %-20.20s %-10s %s\n' \
+            "$id" "$name" "$source" "$size" "${updated:-$installed}"
+    done
+    shopt -u nullglob
+
+    (( any == 1 )) || echo "尚未安装任何由此脚本管理的 AppImage。"
+}
+
+info_cmd() {
+    [[ $# -eq 1 ]] || die "用法: appimage info <app-id>"
+    ensure_dirs
+
+    local app_id="$1"
+    meta_exists "$app_id" || die "未安装: $app_id"
+
+    local name file command desktop install_dir installed updated source size sha icons_record runtime ime_mode
+    name="$(meta_get "$app_id" name)"
+    file="$(meta_get "$app_id" appimage)"
+    command="$(meta_get "$app_id" command)"
+    desktop="$(meta_get "$app_id" desktop)"
+    install_dir="$(meta_get "$app_id" install_dir)"
+    installed="$(meta_get "$app_id" installed_at)"
+    updated="$(meta_get "$app_id" updated_at)"
+    source="$(meta_get "$app_id" source)"
+    icons_record="$(meta_dir "$app_id")/icons"
+    runtime="$(meta_get "$app_id" runtime)"
+    ime_mode="$(meta_get "$app_id" ime_mode)"
+
+    if [[ -f "$file" ]]; then
+        size="$(du -h "$file" | awk '{print $1}')"
+        sha="$(sha256sum "$file" | awk '{print $1}')"
+    else
+        size="missing"
+        sha="missing"
+    fi
+
+    printf 'Name        : %s\n' "$name"
+    printf 'ID          : %s\n' "$app_id"
+    printf 'Source      : %s\n' "$source"
+    printf 'AppImage    : %s\n' "$file"
+    printf 'Command     : %s\n' "$command"
+    printf 'Runtime     : %s\n' "${runtime:-unknown}"
+    printf 'IME mode    : %s\n' "${ime_mode:-auto}"
+    printf 'Desktop     : %s\n' "$desktop"
+    printf 'Install dir : %s\n' "$install_dir"
+    printf 'Size        : %s\n' "$size"
+    printf 'Installed   : %s\n' "$installed"
+    printf 'Updated     : %s\n' "${updated:-never}"
+    printf 'SHA256      : %s\n' "$sha"
+
+    if [[ -s "$icons_record" ]]; then
+        echo 'Icons       :'
+        sed 's/^/  - /' "$icons_record"
+    fi
+}
+
+ime_cmd() {
+    [[ $# -eq 2 ]] || die "用法: appimage ime <app-id> <auto|wayland|x11|off>"
+    ensure_dirs
+
+    local app_id="$1" mode="$2" target runtime desktop app_name field_code launcher
+    meta_exists "$app_id" || die "未安装: $app_id"
+    case "$mode" in auto|wayland|x11|off) ;; *) die "IME 模式必须是 auto、wayland、x11 或 off" ;; esac
+
+    target="$(meta_get "$app_id" appimage)"
+    runtime="$(meta_get "$app_id" runtime)"
+    desktop="$(meta_get "$app_id" desktop)"
+    app_name="$(meta_get "$app_id" name)"
+    launcher="$BIN_DIR/$app_id"
+    [[ -n "$target" && -f "$target" ]] || die "AppImage 文件不存在: $target"
+    [[ -n "$runtime" ]] || runtime="generic"
+
+    write_launcher "$app_id" "$target" "$runtime" "$mode"
+    if [[ -n "$desktop" && -f "$desktop" ]]; then
+        field_code="$(choose_field_code "$desktop")"
+        patch_desktop "$desktop" "$desktop.tmp" "$app_name" "$launcher" "$app_id" "$field_code"
+        mv -f "$desktop.tmp" "$desktop"
+    fi
+    meta_set "$app_id" command "$launcher"
+    meta_set "$app_id" ime_mode "$mode"
+    refresh_caches
+    success "$app_id 输入法模式已设为: $mode"
+
+    if [[ "$runtime" == "generic" && "$mode" != "off" ]]; then
+        warn "该应用未识别为 Electron/Chromium；请先运行: appimage repair $app_id"
+    fi
+}
+
+repair_cmd() {
+    [[ $# -eq 1 ]] || die "用法: appimage repair <app-id>"
+    ensure_dirs
+
+    local app_id="$1" target runtime ime_mode tmp root desktop app_name field_code launcher
+    meta_exists "$app_id" || die "未安装: $app_id"
+    target="$(meta_get "$app_id" appimage)"
+    [[ -n "$target" && -f "$target" ]] || die "AppImage 文件不存在: $target"
+    ime_mode="$(meta_get "$app_id" ime_mode)"
+    desktop="$(meta_get "$app_id" desktop)"
+    app_name="$(meta_get "$app_id" name)"
+    launcher="$BIN_DIR/$app_id"
+    [[ -n "$ime_mode" ]] || ime_mode="auto"
+
+    tmp="$(mktemp -d)"
+    trap 'rm -rf -- "$tmp"' EXIT
+    root="$tmp/squashfs-root"
+    info "重新检测 $app_id..."
+    if extract_appimage "$target" "$tmp"; then
+        runtime="$(detect_runtime "$root")"
+    else
+        runtime="$(meta_get "$app_id" runtime)"
+        [[ -n "$runtime" ]] || runtime="generic"
+        warn "无法解包 AppImage，沿用运行时类型: $runtime"
+    fi
+
+    write_launcher "$app_id" "$target" "$runtime" "$ime_mode"
+    if [[ -n "$desktop" && -f "$desktop" ]]; then
+        field_code="$(choose_field_code "$desktop")"
+        patch_desktop "$desktop" "$desktop.tmp" "$app_name" "$launcher" "$app_id" "$field_code"
+        mv -f "$desktop.tmp" "$desktop"
+    fi
+    meta_set "$app_id" command "$launcher"
+    meta_set "$app_id" runtime "$runtime"
+    meta_set "$app_id" ime_mode "$ime_mode"
+    meta_set "$app_id" repaired_at "$(date '+%Y-%m-%d %H:%M:%S')"
+    refresh_caches
+
+    rm -rf -- "$tmp"
+    trap - EXIT
+    success "$app_id 启动器已修复（runtime=$runtime, ime=$ime_mode）"
+}
+
+main() {
+    local cmd="${1:-help}"
+    [[ $# -gt 0 ]] && shift || true
+
+    case "$cmd" in
+        install)              install_cmd "$@" ;;
+        uninstall|remove|rm)  uninstall_cmd "$@" ;;
+        update|upgrade)       update_cmd "$@" ;;
+        list|ls)              list_cmd "$@" ;;
+        info|show)            info_cmd "$@" ;;
+        ime)                  ime_cmd "$@" ;;
+        repair)               repair_cmd "$@" ;;
+        help|-h|--help)       usage ;;
+        version|-v|--version)
+            echo "appimage manager $VERSION"
+            echo "script: $(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+            ;;
+        *)
+            # 兼容：appimage xxx.AppImage 等同于 install
+            if [[ -f "$cmd" ]]; then
+                install_cmd "$cmd" "$@"
+            else
+                usage
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+main "$@"
