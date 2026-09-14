@@ -37,24 +37,29 @@ koreader.kpkg
 ## 安装步骤
 
 1. 通过 USB 将下载并重命名后的 `koreader.kpkg` 复制到 Kindle 用户存储根目录。
-2. 将本仓库的 `install-koreader.sh` 复制到同一目录。
-3. 安全弹出 Kindle，然后通过设备上的终端或其他可执行 shell 脚本的方式运行：
-
-   ```sh
-   sh /mnt/us/install-koreader.sh
-   ```
+2. 将本仓库的 `install-koreader.sh` 复制到 Kindle 的 `documents` 文件夹。
+3. 安全弹出 Kindle，然后在图书馆中找到名为 **install-koreader** 的“书”并点击。
+4. 等待约 30 秒，即可完成安装。
 
 复制完成后的设备路径应为：
 
 ```text
 /mnt/us/koreader.kpkg
-/mnt/us/install-koreader.sh
+/mnt/us/documents/install-koreader.sh
 ```
 
 脚本随后会设置 KPM 所需的动态库路径，并以非交互方式执行本地安装：
 
 ```sh
 /var/local/kmc/kindlehf/bin/kpm -d -y install "file:///mnt/us/koreader.kpkg"
+```
+
+## 启动 KOReader
+
+安装完成后，在 Kindle 搜索栏中输入以下命令，即可进入 KOReader：
+
+```text
+;kpm launch koreader
 ```
 
 ## 查看安装结果
