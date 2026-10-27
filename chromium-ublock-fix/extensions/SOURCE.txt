@@ -1,0 +1,8 @@
+Component: uBlock Origin 1.75.0, unpacked Chromium Manifest V2 build
+Upstream: https://github.com/gorhill/uBlock
+License: GPL-3.0; see uBlock-Origin-1.75.0/LICENSE.txt and bundled component notices.
+Imported on 2026-10-27 from the existing local chromium-ubo installation.
+The original downloaded archive is not present; its exact release URL is not recorded.
+The installed manifest's fixed public extension-ID key is preserved as supplied.
+No browser profile, cookies, login data, or personal extension settings are included.
+This snapshot includes its packaged filter lists; no runtime source-code download is required.
